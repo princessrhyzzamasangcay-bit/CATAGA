@@ -7,8 +7,8 @@
     "dev": "vite --root frontend",
     "build": "vite build frontend",
     "preview": "vite preview frontend",
-    "backend": "node backend/server.cjs",
-    "server": "node backend/server.cjs"
+    "backend": "node backend/server.js",
+    "server": "node backend/server.js"
   },
   "dependencies": {
     "firebase": "^11.10.0",
