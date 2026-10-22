@@ -1,0 +1,25 @@
+{
+  "name": "montenegro-lines",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --root frontend",
+    "build": "vite build frontend",
+    "preview": "vite preview frontend",
+    "backend": "node backend/server.cjs",
+    "server": "node backend/server.cjs"
+  },
+  "dependencies": {
+    "firebase": "^11.10.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "express": "^5.1.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.2"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^6.0.0"
+  }
+}

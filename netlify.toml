@@ -1,0 +1,9 @@
+[build]
+  command = "npm run build"
+  publish = "frontend/dist"
+
+# React Router / client-side routes should fall back to the app entry point.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

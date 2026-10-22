@@ -1,0 +1,62 @@
+{
+  "routes": [
+    {
+      "key": "Roxas, Oriental Mindoro → Caticlan, Malay, Aklan",
+      "label": "Roxas, Oriental Mindoro → Caticlan, Malay, Aklan",
+      "from": "Roxas, Oriental Mindoro",
+      "to": "Caticlan, Malay, Aklan",
+      "frequency": "Daily",
+      "fare": 460,
+      "vessel": "MV Reina del Cielo",
+      "duration": "About 3–4 hours",
+      "note": "Dangay / Port of Roxas to Caticlan area"
+    },
+    {
+      "key": "Caticlan, Malay, Aklan → Roxas, Oriental Mindoro",
+      "label": "Caticlan, Malay, Aklan → Roxas, Oriental Mindoro",
+      "from": "Caticlan, Malay, Aklan",
+      "to": "Roxas, Oriental Mindoro",
+      "frequency": "Daily",
+      "fare": 460,
+      "vessel": "MV Reina del Cielo",
+      "duration": "About 3–4 hours",
+      "note": "Caticlan to Dangay / Port of Roxas"
+    },
+    {
+      "key": "Roxas, Oriental Mindoro → Odiongan, Romblon",
+      "label": "Roxas, Oriental Mindoro → Odiongan, Romblon",
+      "from": "Roxas, Oriental Mindoro",
+      "to": "Odiongan, Romblon",
+      "frequency": "Tuesday & Friday",
+      "fare": 870,
+      "vessel": "MV Reina Genoveva",
+      "duration": "About 2–3 hours",
+      "note": "Dangay / Port of Roxas to Poctoy, Odiongan"
+    },
+    {
+      "key": "Odiongan, Romblon → Roxas, Oriental Mindoro",
+      "label": "Odiongan, Romblon → Roxas, Oriental Mindoro",
+      "from": "Odiongan, Romblon",
+      "to": "Roxas, Oriental Mindoro",
+      "frequency": "Tuesday & Friday",
+      "fare": 1000,
+      "vessel": "MV Reina Genoveva",
+      "duration": "About 2–3 hours",
+      "note": "Poctoy, Odiongan to Dangay / Port of Roxas"
+    }
+  ],
+  "schedules": [
+    {
+      "key": "schedule-1791003624759",
+      "time": "9:00 AM",
+      "route": "Caticlan, Malay, Aklan → Roxas, Oriental Mindoro",
+      "vessel": "MV Reina Genoveva",
+      "days": "saturday, monday",
+      "capacity": 120,
+      "booked": 0
+    }
+  ],
+  "removedSchedules": [
+    "schedule-1"
+  ]
+}
