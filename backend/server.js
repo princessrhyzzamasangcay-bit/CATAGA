@@ -842,3 +842,23 @@ app.listen(PORT, HOST, () => {
     printLine();
   }
 });
+
+
+
+app.get("/", (req, res) => {
+  res.status(200).send(`
+    <!DOCTYPE html>
+    <html lang="en">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Montenegro Lines API</title>
+      </head>
+      <body>
+        <h1>Montenegro Lines Backend is Running!</h1>
+        <p>The backend server is online.</p>
+        <p>Health check: <a href="/api/health">/api/health</a></p>
+      </body>
+    </html>
+  `);
+});
