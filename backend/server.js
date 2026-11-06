@@ -1,9 +1,9 @@
-
 import express from "express";
 import cors from "cors";
 import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
+import mysql from "mysql2/promise";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -11,47 +11,75 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = Number(process.env.PORT || process.env.BACKEND_PORT || 8080);
 const HOST = "0.0.0.0";
-
 const distPath = path.join(__dirname, "..", "frontend", "dist");
-const dataDir = path.join(__dirname, "server-data");
-const bookingsFile = path.join(dataDir, "bookings.json");
-const usersFile = path.join(dataDir, "users.json");
-const configFile = path.join(dataDir, "system-config.json");
+
+/* ------------------------------------------------------------------ */
+/* MySQL (XAMPP defaults: root, no password, port 3306)                */
+/* ------------------------------------------------------------------ */
+const db = mysql.createPool({
+  host: process.env.DB_HOST || "localhost",
+  port: Number(process.env.DB_PORT || 3306),
+  user: process.env.DB_USER || "root",
+  password: process.env.DB_PASSWORD || "",
+   database: process.env.DB_NAME || "montenegro",
+  waitForConnections: true,
+  connectionLimit: 10,
+  dateStrings: true, // DATE columns come back as "YYYY-MM-DD" strings
+});
+
+// Real connection test (db.getConnection() alone returns a Promise = always truthy)
+try {
+  const conn = await db.getConnection();
+  conn.release();
+  console.log("Database Connected");
+} catch (error) {
+  console.error("Database connection FAILED:", error.message);
+  console.error("Check: XAMPP MySQL is started, database exists, credentials are correct.");
+}
 
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-function ensureDataFile(file, initialValue = []) {
-  if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
-  }
-
-  if (!fs.existsSync(file)) {
-    writeJson(file, initialValue);
+/* ------------------------------------------------------------------ */
+/* Helpers                                                             */
+/* ------------------------------------------------------------------ */
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
   }
 }
 
-function readJson(file, fallback = []) {
+// Forwards async errors to the Express error handler (no more hanging requests)
+const wrap = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+async function withTransaction(fn) {
+  const conn = await db.getConnection();
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
+    await conn.beginTransaction();
+    const result = await fn(conn);
+    await conn.commit();
+    return result;
   } catch (error) {
-    console.error(`Unable to read ${path.basename(file)}:`, error.message);
+    await conn.rollback();
+    throw error;
+  } finally {
+    conn.release();
+  }
+}
+
+// MariaDB (XAMPP) returns JSON columns as strings; MySQL 8 returns objects.
+function parseJson(value, fallback) {
+  if (value == null) return fallback;
+  if (typeof value === "object") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
     return fallback;
   }
 }
-
-function writeJson(file, value) {
-  if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
-  }
-
-  fs.writeFileSync(file, JSON.stringify(value, null, 2) + "\n", "utf8");
-}
-
-ensureDataFile(bookingsFile, []);
-ensureDataFile(usersFile, []);
-ensureDataFile(configFile, { routes: [], schedules: [] });
 
 function makeId(prefix = "MT") {
   return `${prefix}-${Date.now()}-${Math.random()
@@ -60,20 +88,146 @@ function makeId(prefix = "MT") {
     .toUpperCase()}`;
 }
 
-function routeForBooking(config, routeLabel) {
-  return (config.routes || []).find(
-    (route) => (route.label || route.key) === routeLabel || route.key === routeLabel
+const round2 = (n) => Math.round(n * 100) / 100;
+
+const DISCOUNT_RATES = {
+  Regular: 0,
+  PWD: 0.2,
+  "Senior Citizen": 0.2,
+  Child: 0.5,
+};
+
+/* ---------- row <-> object mappers (keep the same JSON shape as before) ---------- */
+function mapRoute(row) {
+  return {
+    ...parseJson(row.extra, {}),
+    key: row.route_key,
+    label: row.label,
+    fare: Number(row.fare),
+  };
+}
+
+function mapSchedule(row) {
+  return {
+    key: row.schedule_key,
+    time: row.time,
+    route: row.route,
+    vessel: row.vessel,
+    days: row.days,
+    capacity: Number(row.capacity),
+    fare: Number(row.fare),
+    booked: Number(row.booked),
+  };
+}
+
+const BOOKING_KEYS = [
+  "id", "userId", "name", "contact", "route", "date", "schedule",
+  "scheduleKey", "vessel", "qty", "fare", "amount", "payment", "paid",
+  "status", "passengers", "fareBreakdown", "createdAt", "updatedAt",
+];
+
+function mapBooking(row) {
+  const booking = {
+    ...parseJson(row.extra, {}),
+    id: row.id,
+    name: row.name,
+    contact: row.contact,
+    route: row.route,
+    date: row.travel_date,
+    schedule: row.schedule,
+    scheduleKey: row.schedule_key,
+    vessel: row.vessel,
+    qty: Number(row.qty),
+    fare: Number(row.fare),
+    amount: Number(row.amount),
+    payment: row.payment,
+    paid: Boolean(row.paid),
+    status: row.status,
+    fareBreakdown: parseJson(row.fare_breakdown, []),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+
+  if (row.user_id != null) booking.userId = row.user_id;
+  const passengers = parseJson(row.passengers, null);
+  if (passengers) booking.passengers = passengers;
+
+  return booking;
+}
+
+function bookingToRow(b) {
+  // Any extra fields the frontend sends are kept in the `extra` JSON column.
+  const extra = Object.fromEntries(
+    Object.entries(b).filter(([key]) => !BOOKING_KEYS.includes(key))
+  );
+
+  return {
+    id: b.id,
+    user_id: b.userId ?? null,
+    name: b.name,
+    contact: b.contact,
+    route: b.route,
+    travel_date: b.date,
+    schedule: b.schedule,
+    schedule_key: b.scheduleKey ?? null,
+    vessel: b.vessel ?? null,
+    qty: b.qty,
+    fare: b.fare,
+    amount: b.amount,
+    payment: b.payment ?? null,
+    paid: b.paid ? 1 : 0,
+    status: b.status,
+    passengers: b.passengers ? JSON.stringify(b.passengers) : null,
+    fare_breakdown: JSON.stringify(b.fareBreakdown || []),
+    extra: JSON.stringify(extra),
+    created_at: b.createdAt,
+    updated_at: b.updatedAt,
+  };
+}
+
+/* ---------- lookups ---------- */
+async function findRoute(conn, routeLabel) {
+  const [rows] = await conn.query(
+    "SELECT * FROM routes WHERE label = ? OR route_key = ? LIMIT 1",
+    [routeLabel, routeLabel]
+  );
+  return rows[0] ? mapRoute(rows[0]) : null;
+}
+
+// lock = true -> SELECT ... FOR UPDATE (prevents two people taking the last seat)
+async function findSchedule(conn, booking, lock = false) {
+  const suffix = lock ? " FOR UPDATE" : "";
+  const [rows] = booking.scheduleKey
+    ? await conn.query(
+        `SELECT * FROM schedules WHERE schedule_key = ?${suffix}`,
+        [booking.scheduleKey]
+      )
+    : await conn.query(
+        `SELECT * FROM schedules WHERE route = ? AND \`time\` = ? LIMIT 1${suffix}`,
+        [booking.route, booking.schedule]
+      );
+
+  return rows[0] ? mapSchedule(rows[0]) : null;
+}
+
+async function changeScheduleBooked(conn, scheduleKey, delta) {
+  if (!scheduleKey) return;
+  await conn.query(
+    "UPDATE schedules SET booked = GREATEST(0, booked + ?) WHERE schedule_key = ?",
+    [Number(delta) || 0, scheduleKey]
   );
 }
 
-function scheduleForBooking(config, booking) {
-  const schedules = Array.isArray(config.schedules) ? config.schedules : [];
-
-  return schedules.find((schedule) =>
-    booking.scheduleKey
-      ? schedule.key === booking.scheduleKey
-      : schedule.route === booking.route && schedule.time === booking.schedule
+async function getScheduleByKey(conn, key) {
+  const [rows] = await conn.query(
+    "SELECT * FROM schedules WHERE schedule_key = ?",
+    [key]
   );
+  return rows[0] ? mapSchedule(rows[0]) : null;
+}
+
+function isBookingActive(status) {
+  return String(status || "Pending").toLowerCase() !== "cancelled";
 }
 
 function scheduleMatchesDate(schedule, date) {
@@ -82,9 +236,9 @@ function scheduleMatchesDate(schedule, date) {
     return true;
   }
 
-  const day = new Intl.DateTimeFormat("en-US", {
-    weekday: "long",
-  }).format(new Date(`${date}T12:00:00`));
+  const day = new Intl.DateTimeFormat("en-US", { weekday: "long" }).format(
+    new Date(`${date}T12:00:00`)
+  );
 
   return String(schedule.days)
     .split(/[&,]/)
@@ -93,25 +247,52 @@ function scheduleMatchesDate(schedule, date) {
     .includes(day.toLowerCase());
 }
 
-function isBookingActive(status) {
-  return String(status || "Pending").toLowerCase() !== "cancelled";
+function buildFareBreakdown(passengerList, qty, baseFare, { strict = false } = {}) {
+  return Array.from({ length: qty }, (_, index) => {
+    const passenger = passengerList[index] || {};
+    const type = Object.hasOwn(DISCOUNT_RATES, passenger.discountType)
+      ? passenger.discountType
+      : "Regular";
+    const age = Number(passenger.age || 0);
+
+    if (strict) {
+      if (type === "Senior Citizen" && age < 60) {
+        throw new HttpError(400, "Senior Citizen discount requires age 60 or older.");
+      }
+      if (type === "Child" && age > 11) {
+        throw new HttpError(400, "Child discount is only for ages 11 and below.");
+      }
+      if (type === "PWD" && !String(passenger.pwdId || passenger.discountIdReference || "").trim()) {
+        throw new HttpError(400, "PWD ID/reference is required for the PWD discount.");
+      }
+    }
+
+    const discountAmount = round2(baseFare * DISCOUNT_RATES[type]);
+
+    return {
+      name: String(passenger.name || ""),
+      age,
+      discountType: type,
+      discountPercent: Math.round(DISCOUNT_RATES[type] * 100),
+      discountIdType:
+        passenger.discountIdType ||
+        (type === "PWD"
+          ? "PWD ID"
+          : type === "Senior Citizen"
+            ? "Senior Citizen ID"
+            : type === "Child"
+              ? "Proof of age"
+              : ""),
+      discountIdReference:
+        passenger.discountIdReference || passenger.pwdId || passenger.seniorId || "",
+      baseFare,
+      discountAmount,
+      finalFare: round2(baseFare - discountAmount),
+    };
+  });
 }
 
-function changeScheduleBooked(config, scheduleKey, delta) {
-  if (!scheduleKey) return;
-
-  const schedule = (config.schedules || []).find(
-    (item) => item.key === scheduleKey
-  );
-
-  if (!schedule) return;
-
-  schedule.booked = Math.max(
-    0,
-    Number(schedule.booked || 0) + Number(delta || 0)
-  );
-}
-
+/* ---------- console printing ---------- */
 function printLine(char = "-", length = 62) {
   console.log(char.repeat(length));
 }
@@ -129,9 +310,7 @@ function printBookingSummary(booking) {
   console.log(`  Date       : ${booking.date || "-"}`);
   console.log(`  Schedule   : ${booking.schedule || "-"}`);
   console.log(`  Passengers : ${booking.qty || 1}`);
-  console.log(
-    `  Amount     : ₱${Number(booking.amount || 0).toLocaleString()}`
-  );
+  console.log(`  Amount     : ₱${Number(booking.amount || 0).toLocaleString()}`);
   console.log(`  Payment    : ${booking.payment || "-"}`);
   console.log(`  Status     : ${booking.status || "Pending"}`);
 }
@@ -146,49 +325,59 @@ app.use((req, res, next) => {
     console.log(`  Schedule   : ${req.body?.schedule || "-"}`);
     printLine();
   }
-
   next();
 });
 
-app.get("/api/health", (req, res) => {
+/* ------------------------------------------------------------------ */
+/* Health                                                              */
+/* ------------------------------------------------------------------ */
+app.get("/api/health", wrap(async (req, res) => {
+  await db.query("SELECT 1");
   res.json({
     ok: true,
+    database: "connected",
     message: "Montenegro Lines Backend is running.",
   });
-});
+}));
 
-app.get("/api/config", (req, res) => {
+/* ------------------------------------------------------------------ */
+/* CONFIG: routes + schedules                                          */
+/* ------------------------------------------------------------------ */
+app.get("/api/config", wrap(async (req, res) => {
+  const [routes] = await db.query("SELECT * FROM routes ORDER BY seq");
+  const [schedules] = await db.query("SELECT * FROM schedules ORDER BY seq");
+  const [removed] = await db.query("SELECT kind, item_key FROM removed_config");
+
   res.json({
     success: true,
-    ...readJson(configFile, { routes: [], schedules: [] }),
+    routes: routes.map(mapRoute),
+    schedules: schedules.map(mapSchedule),
+    removedRoutes: removed.filter((r) => r.kind === "route").map((r) => r.item_key),
+    removedSchedules: removed.filter((r) => r.kind === "schedule").map((r) => r.item_key),
   });
-});
+}));
 
-app.patch("/api/config/routes/:routeKey", (req, res) => {
-  const config = readJson(configFile, { routes: [], schedules: [] });
-  const routes = Array.isArray(config.routes) ? config.routes : [];
+// Create or update a route (UPSERT)
+app.patch("/api/config/routes/:routeKey", wrap(async (req, res) => {
   const routeKey = req.params.routeKey;
 
-  const index = routes.findIndex((item) => item.key === routeKey);
+  const [rows] = await db.query("SELECT * FROM routes WHERE route_key = ?", [routeKey]);
+  const current = rows[0] ? mapRoute(rows[0]) : {};
+  const merged = { ...current, ...req.body, key: routeKey };
+  const { key, label, fare, ...extra } = merged;
 
-  const next = {
-    ...(index >= 0 ? routes[index] : {}),
-    ...req.body,
-    key: routeKey,
-  };
-
-  if (index >= 0) {
-    routes[index] = next;
-  } else {
-    routes.push(next);
-  }
-
-  config.routes = routes;
-  config.removedRoutes = (config.removedRoutes || []).filter(
-    (key) => key !== routeKey
+  await db.query(
+    `INSERT INTO routes (route_key, label, fare, extra) VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE label = VALUES(label), fare = VALUES(fare), extra = VALUES(extra)`,
+    [routeKey, label || routeKey, Number(fare) || 0, JSON.stringify(extra)]
+  );
+  await db.query(
+    "DELETE FROM removed_config WHERE kind = 'route' AND item_key = ?",
+    [routeKey]
   );
 
-  writeJson(configFile, config);
+  const [saved] = await db.query("SELECT * FROM routes WHERE route_key = ?", [routeKey]);
+  const next = mapRoute(saved[0]);
 
   printSection("ROUTE UPDATED");
   console.log(`  Route      : ${next.label || routeKey}`);
@@ -196,35 +385,30 @@ app.patch("/api/config/routes/:routeKey", (req, res) => {
   printLine();
 
   res.json({ success: true, route: next });
-});
+}));
 
-// Delete a route.
-app.delete("/api/config/routes/:routeKey", (req, res) => {
-  const config = readJson(configFile, { routes: [], schedules: [] });
-  const key = decodeURIComponent(req.params.routeKey);
+app.delete("/api/config/routes/:routeKey", wrap(async (req, res) => {
+  const key = req.params.routeKey; // Express already decodes it
 
-  const route = (config.routes || []).find(
-    (item) =>
-      (item.label || item.key) === key || item.key === key
-  );
+  await withTransaction(async (conn) => {
+    const route = await findRoute(conn, key);
+    if (!route) {
+      throw new HttpError(404, "Route not found in server configuration.");
+    }
 
-  if (!route) {
-    return res.status(404).json({
-      success: false,
-      message: "Route not found in server configuration.",
-    });
-  }
+    await conn.query(
+      "DELETE FROM schedules WHERE route IN (?, ?, ?)",
+      [key, route.key, route.label]
+    );
+    await conn.query("DELETE FROM routes WHERE route_key = ?", [route.key]);
 
-  config.routes = config.routes.filter((item) => item !== route);
-  config.removedRoutes = [
-    ...new Set([...(config.removedRoutes || []), key, route.key].filter(Boolean)),
-  ];
-
-  config.schedules = (config.schedules || []).filter(
-    (item) => item.route !== key && item.route !== route.key && item.route !== route.label
-  );
-
-  writeJson(configFile, config);
+    for (const k of new Set([key, route.key].filter(Boolean))) {
+      await conn.query(
+        "INSERT IGNORE INTO removed_config (kind, item_key) VALUES ('route', ?)",
+        [k]
+      );
+    }
+  });
 
   printSection("ROUTE DELETED");
   console.log(`  Route      : ${key}`);
@@ -232,11 +416,9 @@ app.delete("/api/config/routes/:routeKey", (req, res) => {
   printLine();
 
   res.json({ success: true, route: key });
-});
+}));
 
-app.post("/api/config/schedules", (req, res) => {
-  const config = readJson(configFile, { routes: [], schedules: [] });
-  const schedules = Array.isArray(config.schedules) ? config.schedules : [];
+app.post("/api/config/schedules", wrap(async (req, res) => {
   const body = req.body || {};
 
   if (
@@ -248,10 +430,7 @@ app.post("/api/config/schedules", (req, res) => {
     !Number.isFinite(Number(body.fare)) ||
     Number(body.fare) < 0
   ) {
-    return res.status(400).json({
-      success: false,
-      message: "Please complete all schedule fields.",
-    });
+    throw new HttpError(400, "Please complete all schedule fields.");
   }
 
   const schedule = {
@@ -266,15 +445,19 @@ app.post("/api/config/schedules", (req, res) => {
   };
 
   if (schedule.booked > schedule.capacity) {
-    return res.status(400).json({
-      success: false,
-      message: "Booked seats cannot exceed schedule capacity.",
-    });
+    throw new HttpError(400, "Booked seats cannot exceed schedule capacity.");
   }
 
-  schedules.push(schedule);
-  config.schedules = schedules;
-  writeJson(configFile, config);
+  await db.query(
+    `INSERT INTO schedules (schedule_key, \`time\`, route, vessel, days, capacity, fare, booked)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [schedule.key, schedule.time, schedule.route, schedule.vessel,
+     schedule.days, schedule.capacity, schedule.fare, schedule.booked]
+  );
+  await db.query(
+    "DELETE FROM removed_config WHERE kind = 'schedule' AND item_key = ?",
+    [schedule.key]
+  );
 
   printSection("SCHEDULE ADDED");
   console.log(`  Schedule   : ${schedule.time}`);
@@ -287,23 +470,12 @@ app.post("/api/config/schedules", (req, res) => {
   printLine();
 
   res.status(201).json({ success: true, schedule });
-});
+}));
 
-app.patch("/api/config/schedules/:scheduleKey", (req, res) => {
-  const config = readJson(configFile, { routes: [], schedules: [] });
-  const schedules = Array.isArray(config.schedules) ? config.schedules : [];
-  const index = schedules.findIndex(
-    (item) => item.key === req.params.scheduleKey
-  );
+app.patch("/api/config/schedules/:scheduleKey", wrap(async (req, res) => {
+  const current = await getScheduleByKey(db, req.params.scheduleKey);
+  if (!current) throw new HttpError(404, "Schedule not found.");
 
-  if (index === -1) {
-    return res.status(404).json({
-      success: false,
-      message: "Schedule not found.",
-    });
-  }
-
-  const current = schedules[index];
   const next = {
     ...current,
     ...req.body,
@@ -322,22 +494,19 @@ app.patch("/api/config/schedules/:scheduleKey", (req, res) => {
     !Number.isFinite(next.fare) ||
     next.fare < 0
   ) {
-    return res.status(400).json({
-      success: false,
-      message: "Please complete all schedule fields.",
-    });
+    throw new HttpError(400, "Please complete all schedule fields.");
   }
 
   if (next.capacity < next.booked) {
-    return res.status(400).json({
-      success: false,
-      message: `Capacity cannot be lower than ${next.booked} booked seats.`,
-    });
+    throw new HttpError(400, `Capacity cannot be lower than ${next.booked} booked seats.`);
   }
 
-  schedules[index] = next;
-  config.schedules = schedules;
-  writeJson(configFile, config);
+  await db.query(
+    `UPDATE schedules
+     SET \`time\` = ?, route = ?, vessel = ?, days = ?, capacity = ?, fare = ?
+     WHERE schedule_key = ?`,
+    [next.time, next.route, next.vessel, next.days, next.capacity, next.fare, current.key]
+  );
 
   printSection("SCHEDULE UPDATED");
   console.log(`  Schedule   : ${next.time}`);
@@ -350,28 +519,22 @@ app.patch("/api/config/schedules/:scheduleKey", (req, res) => {
   printLine();
 
   res.json({ success: true, schedule: next });
-});
+}));
 
-app.delete("/api/config/schedules/:scheduleKey", (req, res) => {
-  const config = readJson(configFile, { routes: [], schedules: [] });
-  const key = decodeURIComponent(req.params.scheduleKey);
-  const schedules = Array.isArray(config.schedules) ? config.schedules : [];
-  const index = schedules.findIndex((item) => item.key === key);
+app.delete("/api/config/schedules/:scheduleKey", wrap(async (req, res) => {
+  const key = req.params.scheduleKey;
 
-  if (index < 0) {
-    return res.status(404).json({
-      success: false,
-      message: "Schedule not found.",
-    });
-  }
+  const removed = await withTransaction(async (conn) => {
+    const schedule = await getScheduleByKey(conn, key);
+    if (!schedule) throw new HttpError(404, "Schedule not found.");
 
-  const [removed] = schedules.splice(index, 1);
-  config.schedules = schedules;
-  config.removedSchedules = [
-    ...new Set([...(config.removedSchedules || []), key]),
-  ];
-
-  writeJson(configFile, config);
+    await conn.query("DELETE FROM schedules WHERE schedule_key = ?", [key]);
+    await conn.query(
+      "INSERT IGNORE INTO removed_config (kind, item_key) VALUES ('schedule', ?)",
+      [key]
+    );
+    return schedule;
+  });
 
   printSection("SCHEDULE DELETED");
   console.log(`  Schedule   : ${removed.time || "-"}`);
@@ -381,150 +544,70 @@ app.delete("/api/config/schedules/:scheduleKey", (req, res) => {
   printLine();
 
   res.json({ success: true, schedule: removed });
-});
+}));
 
-app.post("/api/bookings", (req, res) => {
+/* ------------------------------------------------------------------ */
+/* BOOKINGS                                                            */
+/* ------------------------------------------------------------------ */
+
+// CREATE
+app.post("/api/bookings", wrap(async (req, res) => {
   const body = req.body || {};
 
   if (!body.name || !body.contact || !body.route || !body.date || !body.schedule) {
-    return res.status(400).json({
-      success: false,
-      message: "Please complete all required booking fields.",
-    });
+    throw new HttpError(400, "Please complete all required booking fields.");
   }
 
-  const config = readJson(configFile, { routes: [], schedules: [] });
-  const route = routeForBooking(config, body.route);
-  const schedule = scheduleForBooking(config, body);
   const qty = Math.max(1, Math.floor(Number(body.qty) || 1));
 
-  if (!route) {
-    return res.status(400).json({
-      success: false,
-      message: "Selected route is no longer available.",
-    });
-  }
+  const { booking, seatsLeft } = await withTransaction(async (conn) => {
+    const route = await findRoute(conn, body.route);
+    if (!route) throw new HttpError(400, "Selected route is no longer available.");
 
-  if (!schedule) {
-    return res.status(400).json({
-      success: false,
-      message: "Selected schedule is no longer available.",
-    });
-  }
+    const schedule = await findSchedule(conn, body, true);
+    if (!schedule) throw new HttpError(400, "Selected schedule is no longer available.");
 
-  if (!scheduleMatchesDate(schedule, body.date)) {
-    return res.status(400).json({
-      success: false,
-      message: "Selected schedule is not available on this date.",
-    });
-  }
-
-  const availableSeats = Math.max(
-    0,
-    Number(schedule.capacity || 0) - Number(schedule.booked || 0)
-  );
-
-  if (qty > availableSeats) {
-    return res.status(409).json({
-      success: false,
-      message: `Only ${availableSeats} seat(s) are available for this schedule.`,
-    });
-  }
-
-  const scheduleFare = Number(schedule.fare ?? route.fare ?? 0);
-  const discountRates = {
-    Regular: 0,
-    PWD: 0.2,
-    "Senior Citizen": 0.2,
-    Child: 0.5,
-  };
-
-  const passengerList = Array.isArray(body.passengers) ? body.passengers : [];
-
-  const fareBreakdown = Array.from({ length: qty }, (_, index) => {
-    const passenger = passengerList[index] || {};
-    const type = Object.prototype.hasOwnProperty.call(
-      discountRates,
-      passenger.discountType
-    )
-      ? passenger.discountType
-      : "Regular";
-
-    const age = Number(passenger.age || 0);
-
-    if (type === "Senior Citizen" && age < 60) {
-      return {
-        validationError: "Senior Citizen discount requires age 60 or older.",
-      };
+    if (!scheduleMatchesDate(schedule, body.date)) {
+      throw new HttpError(400, "Selected schedule is not available on this date.");
     }
 
-    if (type === "Child" && age > 11) {
-      return {
-        validationError: "Child discount is only for ages 11 and below.",
-      };
+    const availableSeats = Math.max(0, schedule.capacity - schedule.booked);
+    if (qty > availableSeats) {
+      throw new HttpError(409, `Only ${availableSeats} seat(s) are available for this schedule.`);
     }
 
-    if (type === "PWD" && !String(passenger.pwdId || "").trim()) {
-      return {
-        validationError: "PWD ID/reference is required for the PWD discount.",
-      };
-    }
+    const scheduleFare = Number(schedule.fare ?? route.fare ?? 0);
+    const passengerList = Array.isArray(body.passengers) ? body.passengers : [];
+    const fareBreakdown = buildFareBreakdown(passengerList, qty, scheduleFare, { strict: true });
+    const amount = round2(fareBreakdown.reduce((sum, item) => sum + item.finalFare, 0));
+    const now = new Date().toISOString();
 
-    const discountAmount = Math.round(scheduleFare * discountRates[type] * 100) / 100;
-
-    return {
-      name: String(passenger.name || ""),
-      age,
-      discountType: type,
-      discountPercent: Math.round(discountRates[type] * 100),
-      baseFare: scheduleFare,
-      discountAmount,
-      finalFare: Math.round((scheduleFare - discountAmount) * 100) / 100,
+    const newBooking = {
+      ...body,
+      fareBreakdown,
+      id: body.id || makeId("MT"),
+      qty,
+      amount,
+      fare: scheduleFare,
+      route: route.label || route.key,
+      schedule: schedule.time,
+      scheduleKey: schedule.key,
+      vessel: schedule.vessel,
+      paid: Boolean(body.paid),
+      status: "Pending",
+      createdAt: body.createdAt || now,
+      updatedAt: now,
     };
+
+    await conn.query("INSERT INTO bookings SET ?", [bookingToRow(newBooking)]);
+    await changeScheduleBooked(conn, schedule.key, qty);
+
+    return { booking: newBooking, seatsLeft: availableSeats - qty };
   });
-
-  const invalidDiscount = fareBreakdown.find((item) => item.validationError);
-
-  if (invalidDiscount) {
-    return res.status(400).json({
-      success: false,
-      message: invalidDiscount.validationError,
-    });
-  }
-
-  const amount = Math.round(
-    fareBreakdown.reduce((sum, item) => sum + item.finalFare, 0) * 100
-  ) / 100;
-
-  const bookings = readJson(bookingsFile, []);
-  const booking = {
-    ...body,
-    fareBreakdown,
-    id: body.id || makeId("MT"),
-    qty,
-    amount,
-    fare: scheduleFare,
-    route: route.label || route.key,
-    schedule: schedule.time,
-    scheduleKey: schedule.key,
-    vessel: schedule.vessel,
-    paid: Boolean(body.paid),
-    status: "Pending",
-    createdAt: body.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  };
-
-  bookings.unshift(booking);
-  changeScheduleBooked(config, schedule.key, qty);
-
-  writeJson(bookingsFile, bookings);
-  writeJson(configFile, config);
 
   printSection("BOOKING SAVED SUCCESSFULLY");
   printBookingSummary(booking);
-  console.log(
-    `  Seats Left : ${Math.max(0, Number(schedule.capacity) - Number(schedule.booked))}`
-  );
+  console.log(`  Seats Left : ${seatsLeft}`);
   printLine();
 
   res.status(201).json({
@@ -532,164 +615,120 @@ app.post("/api/bookings", (req, res) => {
     message: "Booking received by Express backend.",
     booking,
   });
-});
+}));
 
-app.get("/api/bookings", (req, res) => {
-  let bookings = readJson(bookingsFile, []);
+// READ (all, or filtered by ?userId=)
+app.get("/api/bookings", wrap(async (req, res) => {
+  const [rows] = req.query.userId
+    ? await db.query(
+        "SELECT * FROM bookings WHERE user_id = ? ORDER BY seq DESC",
+        [req.query.userId]
+      )
+    : await db.query("SELECT * FROM bookings ORDER BY seq DESC");
 
-  if (req.query.userId) {
-    bookings = bookings.filter((booking) => booking.userId === req.query.userId);
-  }
+  res.json(rows.map(mapBooking));
+}));
 
-  res.json(bookings);
-});
+// UPDATE
+app.patch("/api/bookings/:id", wrap(async (req, res) => {
+  const body = req.body || {};
 
-app.patch("/api/bookings/:id", (req, res) => {
-  const bookings = readJson(bookingsFile, []);
-  const index = bookings.findIndex((booking) => booking.id === req.params.id);
+  let result;
+  try {
+    result = await withTransaction(async (conn) => {
+      const [rows] = await conn.query(
+        "SELECT * FROM bookings WHERE id = ? FOR UPDATE",
+        [req.params.id]
+      );
+      if (!rows[0]) throw new HttpError(404, "Booking not found.");
 
-  if (index === -1) {
-    printSection("BOOKING UPDATE FAILED");
-    console.log(`  Booking ID : ${req.params.id}`);
-    console.log("  Reason     : Booking not found.");
-    printLine();
+      const previous = mapBooking(rows[0]);
+      const next = { ...previous, ...body, id: previous.id };
 
-    return res.status(404).json({
-      success: false,
-      message: "Booking not found.",
+      // If the route/time changed without a new scheduleKey, look the schedule up
+      // by route + time instead of sticking to the old scheduleKey.
+      if (!("scheduleKey" in body) && ("schedule" in body || "route" in body)) {
+        delete next.scheduleKey;
+      }
+
+      const route = await findRoute(conn, next.route);
+      if (!route) throw new HttpError(400, "Selected route is no longer available.");
+
+      const schedule = await findSchedule(conn, next, true);
+      if (!schedule) throw new HttpError(400, "Selected schedule is no longer available.");
+
+      if (!scheduleMatchesDate(schedule, next.date)) {
+        throw new HttpError(400, "Selected schedule is not available on this date.");
+      }
+
+      const oldQty = Math.max(1, Number(previous.qty) || 1);
+      const newQty = Math.max(1, Math.floor(Number(next.qty) || 1));
+      const oldActive = isBookingActive(previous.status);
+      const newActive = isBookingActive(next.status);
+      const oldSchedule = await findSchedule(conn, previous);
+      const oldScheduleKey = oldSchedule?.key;
+      const sameSchedule = oldScheduleKey === schedule.key;
+
+      if (newActive) {
+        const seatsAlreadyHeld = sameSchedule && oldActive ? oldQty : 0;
+        const seatsAvailableForEdit = Math.max(
+          0,
+          schedule.capacity - schedule.booked + seatsAlreadyHeld
+        );
+
+        if (newQty > seatsAvailableForEdit) {
+          throw new HttpError(409, `Only ${seatsAvailableForEdit} seat(s) are available for this schedule.`);
+        }
+      }
+
+      if (oldActive) await changeScheduleBooked(conn, oldScheduleKey, -oldQty);
+      if (newActive) await changeScheduleBooked(conn, schedule.key, newQty);
+
+      next.qty = newQty;
+      next.fare = Number(schedule.fare ?? route.fare ?? 0);
+      next.route = route.label || route.key;
+      next.schedule = schedule.time;
+      next.scheduleKey = schedule.key;
+      next.vessel = schedule.vessel;
+
+      const passengerList =
+        Array.isArray(next.passengers) && next.passengers.length
+          ? next.passengers
+          : (Array.isArray(previous.fareBreakdown) ? previous.fareBreakdown : []).map(
+              (item) => ({
+                name: item.name,
+                age: item.age,
+                discountType: item.discountType || "Regular",
+                discountIdType: item.discountIdType,
+                discountIdReference: item.discountIdReference || "",
+                pwdId: item.pwdId || item.discountIdReference || "",
+                seniorId: item.seniorId || item.discountIdReference || "",
+              })
+            );
+
+      next.fareBreakdown = buildFareBreakdown(passengerList, newQty, next.fare);
+      next.amount = round2(next.fareBreakdown.reduce((sum, item) => sum + item.finalFare, 0));
+      next.updatedAt = new Date().toISOString();
+
+      const row = bookingToRow(next);
+      delete row.id;
+      delete row.created_at; // never overwrite creation time
+      await conn.query("UPDATE bookings SET ? WHERE id = ?", [row, previous.id]);
+
+      const updatedSchedule = await getScheduleByKey(conn, schedule.key);
+      return { previous, next, updatedSchedule };
     });
-  }
-
-  const previousBooking = { ...bookings[index] };
-  const config = readJson(configFile, { routes: [], schedules: [] });
-  const next = { ...previousBooking, ...req.body, id: previousBooking.id };
-
-  const route = routeForBooking(config, next.route);
-  const schedule = scheduleForBooking(config, next);
-
-  if (!route) {
-    return res.status(400).json({
-      success: false,
-      message: "Selected route is no longer available.",
-    });
-  }
-
-  if (!schedule) {
-    return res.status(400).json({
-      success: false,
-      message: "Selected schedule is no longer available.",
-    });
-  }
-
-  if (!scheduleMatchesDate(schedule, next.date)) {
-    return res.status(400).json({
-      success: false,
-      message: "Selected schedule is not available on this date.",
-    });
-  }
-
-  const oldQty = Math.max(1, Number(previousBooking.qty) || 1);
-  const newQty = Math.max(1, Math.floor(Number(next.qty) || 1));
-  const oldActive = isBookingActive(previousBooking.status);
-  const newActive = isBookingActive(next.status);
-  const oldScheduleKey =
-    previousBooking.scheduleKey || scheduleForBooking(config, previousBooking)?.key;
-  const newScheduleKey = schedule.key;
-  const sameSchedule = oldScheduleKey === newScheduleKey;
-  const currentBooked = Number(schedule.booked || 0);
-
-  if (newActive) {
-    const seatsAlreadyHeld = sameSchedule && oldActive ? oldQty : 0;
-    const seatsAvailableForEdit = Math.max(
-      0,
-      Number(schedule.capacity || 0) - currentBooked + seatsAlreadyHeld
-    );
-
-    if (newQty > seatsAvailableForEdit) {
-      return res.status(409).json({
-        success: false,
-        message: `Only ${seatsAvailableForEdit} seat(s) are available for this schedule.`,
-      });
+  } catch (error) {
+    if (error instanceof HttpError && error.status === 404) {
+      printSection("BOOKING UPDATE FAILED");
+      console.log(`  Booking ID : ${req.params.id}`);
+      console.log("  Reason     : Booking not found.");
+      printLine();
     }
+    throw error;
   }
 
-  if (oldActive) changeScheduleBooked(config, oldScheduleKey, -oldQty);
-  if (newActive) changeScheduleBooked(config, newScheduleKey, newQty);
-
-  next.qty = newQty;
-  next.fare = Number(schedule.fare ?? route.fare ?? 0);
-  next.route = route.label || route.key;
-  next.schedule = schedule.time;
-  next.scheduleKey = schedule.key;
-  next.vessel = schedule.vessel;
-
-  const discountRates = {
-    Regular: 0,
-    PWD: 0.2,
-    "Senior Citizen": 0.2,
-    Child: 0.5,
-  };
-
-  const passengerList =
-    Array.isArray(next.passengers) && next.passengers.length
-      ? next.passengers
-      : (Array.isArray(previousBooking.fareBreakdown)
-          ? previousBooking.fareBreakdown
-          : []
-        ).map((item) => ({
-          name: item.name,
-          age: item.age,
-          discountType: item.discountType || "Regular",
-          pwdId: item.pwdId || item.discountIdReference || "",
-          seniorId: item.seniorId || item.discountIdReference || "",
-        }));
-
-  next.fareBreakdown = Array.from({ length: newQty }, (_, passengerIndex) => {
-    const passenger = passengerList[passengerIndex] || {};
-    const type = Object.prototype.hasOwnProperty.call(
-      discountRates,
-      passenger.discountType
-    )
-      ? passenger.discountType
-      : "Regular";
-
-    const baseFare = next.fare;
-    const discountAmount = Math.round(baseFare * discountRates[type] * 100) / 100;
-
-    return {
-      name: String(passenger.name || ""),
-      age: Number(passenger.age || 0),
-      discountType: type,
-      discountPercent: Math.round(discountRates[type] * 100),
-      discountIdType:
-        passenger.discountIdType ||
-        (type === "PWD"
-          ? "PWD ID"
-          : type === "Senior Citizen"
-            ? "Senior Citizen ID"
-            : type === "Child"
-              ? "Proof of age"
-              : ""),
-      discountIdReference:
-        passenger.discountIdReference ||
-        passenger.pwdId ||
-        passenger.seniorId ||
-        "",
-      baseFare,
-      discountAmount,
-      finalFare: Math.round((baseFare - discountAmount) * 100) / 100,
-    };
-  });
-
-  next.amount =
-    Math.round(
-      next.fareBreakdown.reduce((sum, item) => sum + item.finalFare, 0) * 100
-    ) / 100;
-  next.updatedAt = new Date().toISOString();
-
-  bookings[index] = next;
-  writeJson(bookingsFile, bookings);
-  writeJson(configFile, config);
+  const { previous, next, updatedSchedule } = result;
 
   printSection("BOOKING UPDATED");
   console.log(`  Method     : PATCH /api/bookings/${req.params.id}`);
@@ -697,84 +736,56 @@ app.patch("/api/bookings/:id", (req, res) => {
   printLine("-", 62);
 
   const fields = [
-    ["Passenger", "name"],
-    ["Contact", "contact"],
-    ["Route", "route"],
-    ["Date", "date"],
-    ["Schedule", "schedule"],
-    ["Passengers", "qty"],
-    ["Amount", "amount"],
-    ["Payment", "payment"],
-    ["Status", "status"],
-    ["Paid", "paid"],
-    ["Vessel", "vessel"],
+    ["Passenger", "name"], ["Contact", "contact"], ["Route", "route"],
+    ["Date", "date"], ["Schedule", "schedule"], ["Passengers", "qty"],
+    ["Amount", "amount"], ["Payment", "payment"], ["Status", "status"],
+    ["Paid", "paid"], ["Vessel", "vessel"],
   ];
 
   let changed = false;
-
   for (const [label, key] of fields) {
-    if (JSON.stringify(previousBooking[key]) !== JSON.stringify(next[key])) {
+    if (JSON.stringify(previous[key]) !== JSON.stringify(next[key])) {
       changed = true;
-      const before = previousBooking[key] ?? "-";
+      const before = previous[key] ?? "-";
       const after = next[key] ?? "-";
-      const beforeText =
-        key === "amount" ? `₱${Number(before || 0).toLocaleString()}` : String(before);
-      const afterText =
-        key === "amount" ? `₱${Number(after || 0).toLocaleString()}` : String(after);
-
+      const beforeText = key === "amount" ? `₱${Number(before || 0).toLocaleString()}` : String(before);
+      const afterText = key === "amount" ? `₱${Number(after || 0).toLocaleString()}` : String(after);
       console.log(`  ${label.padEnd(11)}: ${beforeText}  →  ${afterText}`);
     }
   }
-
   if (!changed) console.log("  No field values changed.");
 
   console.log();
   console.log("  UPDATED BOOKING");
   printLine("-", 62);
   printBookingSummary(next);
-
-  const updatedSchedule = (config.schedules || []).find(
-    (item) => item.key === newScheduleKey
-  );
-
   if (updatedSchedule) {
-    console.log(
-      `  Seats Left : ${Math.max(0, Number(updatedSchedule.capacity) - Number(updatedSchedule.booked))}`
-    );
+    console.log(`  Seats Left : ${Math.max(0, updatedSchedule.capacity - updatedSchedule.booked)}`);
   }
-
   printLine();
 
   res.json({ success: true, booking: next });
-});
+}));
 
-app.delete("/api/bookings/:id", (req, res) => {
-  const bookings = readJson(bookingsFile, []);
-  const index = bookings.findIndex((booking) => booking.id === req.params.id);
-
-  if (index === -1) {
-    return res.status(404).json({
-      success: false,
-      message: "Booking not found.",
-    });
-  }
-
-  const booking = bookings[index];
-  const config = readJson(configFile, { routes: [], schedules: [] });
-  const schedule = scheduleForBooking(config, booking);
-
-  if (schedule && isBookingActive(booking.status)) {
-    changeScheduleBooked(
-      config,
-      schedule.key,
-      -Math.max(1, Number(booking.qty) || 1)
+// DELETE
+app.delete("/api/bookings/:id", wrap(async (req, res) => {
+  const booking = await withTransaction(async (conn) => {
+    const [rows] = await conn.query(
+      "SELECT * FROM bookings WHERE id = ? FOR UPDATE",
+      [req.params.id]
     );
-  }
+    if (!rows[0]) throw new HttpError(404, "Booking not found.");
 
-  bookings.splice(index, 1);
+    const found = mapBooking(rows[0]);
+    const schedule = await findSchedule(conn, found, true);
 
-  writeJson(bookingsFile, bookings);
-  writeJson(configFile, config);
+    if (schedule && isBookingActive(found.status)) {
+      await changeScheduleBooked(conn, schedule.key, -Math.max(1, Number(found.qty) || 1));
+    }
+
+    await conn.query("DELETE FROM bookings WHERE id = ?", [found.id]);
+    return found;
+  });
 
   printSection("BOOKING DELETED");
   printBookingSummary(booking);
@@ -782,46 +793,84 @@ app.delete("/api/bookings/:id", (req, res) => {
   printLine();
 
   res.json({ success: true, id: booking.id });
-});
+}));
 
-app.get("/api/stats", (req, res) => {
-  const bookings = readJson(bookingsFile, []);
+app.get("/api/stats", wrap(async (req, res) => {
+  const [[row]] = await db.query(
+    `SELECT COUNT(*) AS total,
+            SUM(status = 'Pending')   AS pending,
+            SUM(status = 'Confirmed') AS confirmed,
+            SUM(status = 'Cancelled') AS cancelled
+     FROM bookings`
+  );
 
   res.json({
-    totalBookings: bookings.length,
-    pendingBookings: bookings.filter(
-      (booking) => booking.status === "Pending"
-    ).length,
-    confirmedBookings: bookings.filter(
-      (booking) => booking.status === "Confirmed"
-    ).length,
-    cancelledBookings: bookings.filter(
-      (booking) => booking.status === "Cancelled"
-    ).length,
+    totalBookings: Number(row.total || 0),
+    pendingBookings: Number(row.pending || 0),
+    confirmedBookings: Number(row.confirmed || 0),
+    cancelledBookings: Number(row.cancelled || 0),
   });
+}));
+
+/* ------------------------------------------------------------------ */
+/* Frontend / fallbacks                                                */
+/* ------------------------------------------------------------------ */
+app.use("/api", (req, res) => {
+  res.status(404).json({ success: false, message: "API endpoint not found." });
 });
 
 if (fs.existsSync(distPath)) {
   app.use(express.static(distPath));
 
   app.use((req, res, next) => {
-    if (req.method === "GET" && !req.path.startsWith("/api/")) {
+    if (req.method === "GET") {
       return res.sendFile(path.join(distPath, "index.html"));
     }
-
     next();
+  });
+} else {
+  // Only used when there is no built frontend (it used to be unreachable at the bottom)
+  app.get("/", (req, res) => {
+    res.status(200).send(`
+      <!DOCTYPE html>
+      <html lang="en">
+        <head>
+          <meta charset="UTF-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+          <title>Montenegro Lines API</title>
+        </head>
+        <body>
+          <h1>Montenegro Lines Backend is Running!</h1>
+          <p>The backend server is online.</p>
+          <p>Health check: <a href="/api/health">/api/health</a></p>
+        </body>
+      </html>
+    `);
   });
 }
 
-
+/* ------------------------------------------------------------------ */
+/* Error handler (must be after all routes)                            */
+/* ------------------------------------------------------------------ */
 app.use((err, req, res, next) => {
-  console.error("Express error:", err);
-
   if (res.headersSent) return next(err);
 
+  if (err instanceof HttpError) {
+    return res.status(err.status).json({ success: false, message: err.message });
+  }
+  if (err.type === "entity.parse.failed") {
+    return res.status(400).json({ success: false, message: "Invalid JSON body." });
+  }
+  if (err.code === "ER_DUP_ENTRY") {
+    return res.status(409).json({ success: false, message: "Record already exists." });
+  }
+
+  console.error("Express error:", err);
   res.status(500).json({
     success: false,
     message: "Internal server error.",
+    // Debug info: remove before deploying
+    detail: err.code ? `${err.code}: ${err.sqlMessage || err.message}` : err.message,
   });
 });
 
@@ -829,7 +878,9 @@ app.listen(PORT, HOST, () => {
   printSection("MONTENEGRO LINES BACKEND");
   console.log(`  Port       : ${PORT}`);
   console.log(`  Host       : ${HOST}`);
-  console.log("  Health     : /api/health");
+  console.log(`  Local      : http://localhost:${PORT}`);
+  console.log(`  Health     : http://localhost:${PORT}/api/health`);
+  console.log("  Database   : MySQL (XAMPP)");
   console.log("  Bookings   : POST /api/bookings");
   console.log("  Updates    : PATCH /api/bookings/:id");
   console.log("  Deletes    : DELETE /api/bookings/:id");
@@ -841,24 +892,4 @@ app.listen(PORT, HOST, () => {
     console.log("  Info       : Backend API can still run independently.");
     printLine();
   }
-});
-
-
-
-app.get("/", (req, res) => {
-  res.status(200).send(`
-    <!DOCTYPE html>
-    <html lang="en">
-      <head>
-        <meta charset="UTF-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>Montenegro Lines API</title>
-      </head>
-      <body>
-        <h1>Montenegro Lines Backend is Running!</h1>
-        <p>The backend server is online.</p>
-        <p>Health check: <a href="/api/health">/api/health</a></p>
-      </body>
-    </html>
-  `);
 });
