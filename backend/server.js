@@ -21,11 +21,51 @@ const db = mysql.createPool({
   port: Number(process.env.DB_PORT || 3306),
   user: process.env.DB_USER || "root",
   password: process.env.DB_PASSWORD || "",
-   database: process.env.DB_NAME || "montenegro",
+  database: process.env.DB_NAME || "montenegro",
   waitForConnections: true,
   connectionLimit: 10,
   dateStrings: true, // DATE columns come back as "YYYY-MM-DD" strings
 });
+
+// Thread IDs ng connections ng app na ito (para hindi ma-duplicate sa watcher)
+const appThreads = new Set();
+db.pool.on("connection", (conn) => appThreads.add(conn.threadId));
+
+/* ---------- SQL logger: prints every INSERT / UPDATE / DELETE from the app ---------- */
+function logSql(sql, params) {
+  const text = String(typeof sql === "string" ? sql : sql?.sql || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const type = text.split(" ")[0].toUpperCase();
+
+  if (!["INSERT", "UPDATE", "DELETE"].includes(type)) return;
+  if (text === "SELECT 1") return; // skip health-check noise
+
+  console.log(`  [SQL ${type}] ${text.slice(0, 160)}`);
+  if (params !== undefined) {
+    console.log(`  [PARAMS]   ${JSON.stringify(params).slice(0, 160)}`);
+  }
+}
+
+const rawPoolQuery = db.query.bind(db);
+db.query = (sql, params) => {
+  logSql(sql, params);
+  return rawPoolQuery(sql, params);
+};
+
+const rawGetConnection = db.getConnection.bind(db);
+db.getConnection = async () => {
+  const conn = await rawGetConnection();
+  if (!conn.__sqlLogged) {
+    const rawQuery = conn.query.bind(conn);
+    conn.query = (sql, params) => {
+      logSql(sql, params);
+      return rawQuery(sql, params);
+    };
+    conn.__sqlLogged = true; // pooled connections are reused; wrap only once
+  }
+  return conn;
+};
 
 // Real connection test (db.getConnection() alone returns a Promise = always truthy)
 try {
@@ -36,6 +76,67 @@ try {
   console.error("Database connection FAILED:", error.message);
   console.error("Check: XAMPP MySQL is started, database exists, credentials are correct.");
 }
+
+/* ------------------------------------------------------------------ */
+/* phpMyAdmin / external query watcher (MySQL general_log -> terminal) */
+/* ------------------------------------------------------------------ */
+async function startExternalQueryWatcher() {
+  try {
+    await db.query("SET GLOBAL general_log = 'OFF'");
+    await db.query("SET GLOBAL log_output = 'TABLE'");
+    await db.query("TRUNCATE TABLE mysql.general_log"); // linisin ang lumang logs
+    await db.query("SET GLOBAL general_log = 'ON'");
+
+    // Walang laman ang table ngayon, kaya lahat ng papasok ay bago.
+    let lastTime = "1970-01-01 00:00:00";
+
+    console.log("External SQL watcher ON (phpMyAdmin queries will show here)");
+
+    // Default: INSERT/UPDATE/DELETE lang (malinis). Gusto mo rin ang SELECT?
+    // I-run mo ang backend na may SHOW_SELECT=1
+    const SHOW_TYPES = process.env.SHOW_SELECT
+      ? ["SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE"]
+      : ["INSERT", "UPDATE", "DELETE", "REPLACE"];
+
+    const IGNORE =
+      /information_schema|performance_schema|general_log|`phpmyadmin`|`mysql`\.|^SELECT 1$|^SELECT DATABASE\(\)/i;
+
+    setInterval(async () => {
+      try {
+        const [rows] = await db.query(
+          `SELECT event_time, thread_id,
+                  CONVERT(argument USING utf8mb4) AS sql_text
+           FROM mysql.general_log
+           WHERE command_type = 'Query' AND event_time > ?
+           ORDER BY event_time`,
+          [lastTime]
+        );
+
+        for (const row of rows) {
+          lastTime = row.event_time;
+
+          if (appThreads.has(row.thread_id)) continue; // galing sa Express app, skip
+
+          const text = String(row.sql_text || "").replace(/\s+/g, " ").trim();
+          const type = text.split(" ")[0].toUpperCase();
+
+          if (!SHOW_TYPES.includes(type)) continue;
+          if (IGNORE.test(text)) continue;
+
+          console.log(`\n  [phpMyAdmin ${type}] ${String(row.event_time).slice(0, 19)}`);
+          console.log(`  ${text.slice(0, 300)}`);
+        }
+      } catch (err) {
+        console.error("External watcher error:", err.message);
+      }
+    }, 1000);
+  } catch (err) {
+    console.error("Could not enable general_log:", err.message);
+    console.error("Kailangan ng root/SUPER privilege ang DB user.");
+  }
+}
+
+await startExternalQueryWatcher();
 
 app.use(cors());
 app.use(express.json());
