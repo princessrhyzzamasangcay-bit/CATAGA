@@ -14,7 +14,7 @@ const PORT = Number(process.env.PORT || process.env.BACKEND_PORT || 8080);
 const HOST = "0.0.0.0";
 const distPath = path.join(__dirname, "..", "frontend", "dist");
 
-/* MYSQL */
+
 const db = mysql.createPool({
   host: process.env.DB_HOST || "localhost",
   port: Number(process.env.DB_PORT || 3306),
@@ -26,7 +26,7 @@ const db = mysql.createPool({
   dateStrings: true,
 });
 
-/* CLEAN ACTIVITY LOGGER */
+
 function logActivity(action, details = {}) {
   const time = new Date().toLocaleString("en-PH", {
     timeZone: "Asia/Manila",
@@ -99,7 +99,7 @@ function logChanges(previous, next, fields) {
   return changes;
 }
 
-/* DATABASE CONNECTION */
+
 try {
   const conn = await db.getConnection();
   conn.release();
@@ -108,12 +108,12 @@ try {
   console.error("Database connection FAILED:", error.message);
 }
 
-/* MIDDLEWARE */
+
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-/* HELPERS */
+
 class HttpError extends Error {
   constructor(status, message) {
     super(message);
@@ -167,7 +167,7 @@ const DISCOUNT_RATES = {
   Child: 0.5,
 };
 
-/* DATABASE MAPPERS */
+
 function mapRoute(row) {
   return {
     ...parseJson(row.extra, {}),
@@ -255,7 +255,7 @@ function bookingToRow(b) {
   };
 }
 
-/* ROUTE LOOKUP */
+
 async function findRoute(conn, routeValue) {
   const rawValues =
     routeValue && typeof routeValue === "object"
@@ -401,7 +401,9 @@ function buildFareBreakdown(passengerList, qty, baseFare, { strict = false } = {
   });
 }
 
-/* HEALTH */
+
+
+
 app.get("/api/health", wrap(async (req, res) => {
   await db.query("SELECT 1");
 
@@ -412,7 +414,7 @@ app.get("/api/health", wrap(async (req, res) => {
   });
 }));
 
-/* CONFIG */
+
 app.get("/api/config", wrap(async (req, res) => {
   const [routes] = await db.query("SELECT * FROM routes ORDER BY seq");
   const [schedules] = await db.query("SELECT * FROM schedules ORDER BY seq");
@@ -427,7 +429,7 @@ app.get("/api/config", wrap(async (req, res) => {
   });
 }));
 
-/* ADD OR UPDATE ROUTE */
+
 app.patch("/api/config/routes/:routeKey", wrap(async (req, res) => {
   const routeKey = req.params.routeKey;
 
@@ -512,7 +514,7 @@ app.delete("/api/config/routes/:routeKey", wrap(async (req, res) => {
   res.json({ success: true, route: key });
 }));
 
-/* CREATE SCHEDULE */
+
 app.post("/api/config/schedules", wrap(async (req, res) => {
   const body = req.body || {};
 
@@ -577,7 +579,7 @@ app.post("/api/config/schedules", wrap(async (req, res) => {
   res.status(201).json({ success: true, schedule });
 }));
 
-/* UPDATE SCHEDULE */
+
 app.patch("/api/config/schedules/:scheduleKey", wrap(async (req, res) => {
   const current = await getScheduleByKey(db, req.params.scheduleKey);
 
@@ -633,7 +635,7 @@ app.patch("/api/config/schedules/:scheduleKey", wrap(async (req, res) => {
   res.json({ success: true, schedule: next });
 }));
 
-/* DELETE SCHEDULE */
+
 app.delete("/api/config/schedules/:scheduleKey", wrap(async (req, res) => {
   const key = req.params.scheduleKey;
 
@@ -665,7 +667,7 @@ app.delete("/api/config/schedules/:scheduleKey", wrap(async (req, res) => {
   res.json({ success: true, schedule: removed });
 }));
 
-/* CREATE BOOKING */
+
 app.post("/api/bookings", wrap(async (req, res) => {
   const body = req.body || {};
 
@@ -750,7 +752,7 @@ app.post("/api/bookings", wrap(async (req, res) => {
   });
 }));
 
-/* READ BOOKINGS */
+
 app.get("/api/bookings", wrap(async (req, res) => {
   const [rows] = req.query.userId
     ? await db.query(
@@ -762,7 +764,7 @@ app.get("/api/bookings", wrap(async (req, res) => {
   res.json(rows.map(mapBooking));
 }));
 
-/* UPDATE BOOKING */
+
 app.patch("/api/bookings/:id", wrap(async (req, res) => {
   const body = req.body || {};
 
@@ -896,7 +898,7 @@ app.patch("/api/bookings/:id", wrap(async (req, res) => {
   });
 }));
 
-/* DELETE BOOKING */
+
 app.delete("/api/bookings/:id", wrap(async (req, res) => {
   const booking = await withTransaction(async (conn) => {
     const [rows] = await conn.query(
@@ -927,7 +929,7 @@ app.delete("/api/bookings/:id", wrap(async (req, res) => {
   res.json({ success: true, id: booking.id });
 }));
 
-/* STATS */
+
 app.get("/api/stats", wrap(async (req, res) => {
   const [[row]] = await db.query(
     `SELECT COUNT(*) AS total,
@@ -943,9 +945,9 @@ app.get("/api/stats", wrap(async (req, res) => {
     confirmedBookings: Number(row.confirmed || 0),
     cancelledBookings: Number(row.cancelled || 0),
   });
-}));
+}))
 
-/* API 404 */
+
 app.use("/api", (req, res) => {
   res.status(404).json({
     success: false,
@@ -953,7 +955,7 @@ app.use("/api", (req, res) => {
   });
 });
 
-/* FRONTEND */
+
 if (fs.existsSync(distPath)) {
   app.use(express.static(distPath));
 
@@ -983,7 +985,7 @@ if (fs.existsSync(distPath)) {
   });
 }
 
-/* ERROR HANDLER */
+
 app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
 
@@ -1019,7 +1021,7 @@ app.use((err, req, res, next) => {
   });
 });
 
-/* START SERVER */
+
 app.listen(PORT, HOST, () => {
   console.log("==============================================");
   console.log("MONTENEGRO LINES BACKEND");
